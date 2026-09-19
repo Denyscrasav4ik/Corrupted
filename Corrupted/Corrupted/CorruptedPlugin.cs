@@ -11,7 +11,7 @@ using UnityEngine.UI;
 
 namespace Corrupted;
 
-[BepInPlugin("denyscrasav4ik.thedumbfactory.corrupted", "Corrupted", "1.0.0")]
+[BepInPlugin("denyscrasav4ik.thedumbfactory.corrupted", "Corrupted", "1.0.1")]
 public class CorruptedPlugin : BaseUnityPlugin
 {
     public static ConfigEntry<float> CorruptionInterval { get; private set; } = null!;
@@ -121,10 +121,23 @@ public class SceneCorruptor : MonoBehaviour
 
     private void CorruptRenderer(Renderer r)
     {
-        foreach (var mat in r.materials.Where(m => m != null && m.HasProperty("_TextureColor")))
+        foreach (var mat in r.materials.Where(m => m != null))
         {
-            Color current = mat.GetColor("_TextureColor");
-            mat.SetColor("_TextureColor", RandColor(current));
+            Shader shader = mat.shader;
+
+            for (int i = 0; i < shader.GetPropertyCount(); i++)
+            {
+                if (shader.GetPropertyType(i) != UnityEngine.Rendering.ShaderPropertyType.Color)
+                    continue;
+
+                string propertyName = shader.GetPropertyName(i);
+
+                if (propertyName.IndexOf("color", StringComparison.OrdinalIgnoreCase) >= 0)
+                {
+                    Color current = mat.GetColor(propertyName);
+                    mat.SetColor(propertyName, RandColor(current));
+                }
+            }
         }
     }
 
