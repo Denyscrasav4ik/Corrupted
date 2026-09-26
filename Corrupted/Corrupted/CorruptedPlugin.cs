@@ -1,28 +1,40 @@
-﻿using BepInEx;
-using BepInEx.Configuration;
-using UnityEngine;
-using System;
+﻿using System;
 using System.Collections;
+using System.Collections.Generic;
 using System.Linq;
 using System.Reflection;
+using BepInEx;
+using BepInEx.Configuration;
 using TMPro;
+using UnityEngine;
 using UnityEngine.AI;
+using UnityEngine.EventSystems;
 using UnityEngine.UI;
 
 namespace Corrupted;
 
-[BepInPlugin("denyscrasav4ik.thedumbfactory.corrupted", "Corrupted", "1.1.0")]
+[BepInPlugin("denyscrasav4ik.thedumbfactory.corrupted", "Corrupted", "1.2.0")]
 public class CorruptedPlugin : BaseUnityPlugin
 {
-    public static ConfigEntry<float> CorruptionInterval, MinMultiplier, MaxMultiplier, ZeroReplacementMin, ZeroReplacementMax, MeshVertexCorruption, MaterialReplacementChance, SpriteReplacementChance;
-    public static ConfigEntry<bool> AllowNegativeValues, CorruptMeshFilters, CorruptSprites, CorruptMaterials;
+    public static ConfigEntry<float> CorruptionInterval, MinMultiplier, MaxMultiplier, ZeroReplacementMin, ZeroReplacementMax, MeshVertexCorruption, MaterialReplacementChance, SpriteReplacementChance, AnimatorCorruptionChance, RandomMethodChance;
+    public static ConfigEntry<int> CorruptionAmount;
+    public static ConfigEntry<bool> AllowNegativeValues, CorruptMeshFilters, CorruptSprites, CorruptMaterials, IgnoreUnityMethods, ExcludeBuiltInShaderProperties;
+    public static ConfigEntry<string> ExcludedNamesConfig;
+    public static HashSet<string> ExcludedNames = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
 
     private void Awake()
     {
         CorruptionInterval = Config.Bind("Settings", "CorruptionInterval", 1f, "Time in seconds between corruption cycles.");
+        CorruptionAmount = Config.Bind("Settings", "CorruptionAmount", 1, "Amount of objects to corrupt per cycle.");
         MinMultiplier = Config.Bind("Settings", "MinMultiplier", 0f, "Minimum random intensity multiplier.");
         MaxMultiplier = Config.Bind("Settings", "MaxMultiplier", 2f, "Maximum random intensity multiplier.");
         AllowNegativeValues = Config.Bind("Settings", "AllowNegativeValues", false, "Whether negative multipliers are allowed.");
+        RandomMethodChance = Config.Bind("Settings", "RandomMethodChance", 0.5f, "Chance for a random method to be invoked on a script.");
+        IgnoreUnityMethods = Config.Bind("Settings", "IgnoreUnityMethods", true, "Whether methods inherited from UnityEngine.Object/MonoBehaviour should be ignored.");
+        ExcludeBuiltInShaderProperties = Config.Bind("Settings", "ExcludeBuiltInShaderProperties", true, "Whether built-in Unity shader properties (starting with 'unity_') should be excluded from corruption.");
+        ExcludedNamesConfig = Config.Bind("Settings", "ExcludedNames", "InputManager,Steam,UniversalAdditionalCameraData,UniversalAdditionalLightData", "Comma-separated list of script or method names to exclude from corruption.");
+        UpdateExcludedNames();
+        ExcludedNamesConfig.SettingChanged += (sender, args) => UpdateExcludedNames();
 
         ZeroReplacementMin = Config.Bind("Zero Value Corruption", "ZeroReplacementMin", 0.1f, "Minimum absolute value used when corrupting a value that is currently 0.");
         ZeroReplacementMax = Config.Bind("Zero Value Corruption", "ZeroReplacementMax", 2f, "Maximum absolute value used when corrupting a value that is currently 0.");
@@ -32,17 +44,27 @@ public class CorruptedPlugin : BaseUnityPlugin
 
         CorruptSprites = Config.Bind("Asset Corruption", "CorruptSprites", true, "Whether sprites can randomly be replaced.");
         CorruptMaterials = Config.Bind("Asset Corruption", "CorruptMaterials", true, "Whether materials can randomly be replaced.");
-        MaterialReplacementChance = Config.Bind("Asset Corruption", "MaterialReplacementChance", 0.5f, "Chance for a SpriteRenderer/UI Image material to be replaced.");
+        MaterialReplacementChance = Config.Bind("Asset Corruption", "MaterialReplacementChance", 0.5f, "Chance for a material to be replaced.");
         SpriteReplacementChance = Config.Bind("Asset Corruption", "SpriteReplacementChance", 0.5f, "Chance for a sprite to be replaced.");
+        AnimatorCorruptionChance = Config.Bind("Asset Corruption", "AnimatorCorruptionChance", 0.5f, "Chance for an Animator to be corrupted.");
 
         DontDestroyOnLoad(new GameObject("Corrupted_Instance", typeof(SceneCorruptor)));
+    }
+
+    private void UpdateExcludedNames()
+    {
+        ExcludedNames.Clear();
+        foreach (var name in ExcludedNamesConfig.Value.Split(new[] { ',' }, StringSplitOptions.RemoveEmptyEntries))
+        {
+            ExcludedNames.Add(name.Trim());
+        }
     }
 }
 
 public class SceneCorruptor : MonoBehaviour
 {
-    public float minMultiplier => CorruptedPlugin.AllowNegativeValues.Value ? -CorruptedPlugin.MaxMultiplier.Value : CorruptedPlugin.MinMultiplier.Value;
-    public float maxMultiplier => CorruptedPlugin.MaxMultiplier.Value;
+    private float minMultiplier => CorruptedPlugin.AllowNegativeValues.Value ? -CorruptedPlugin.MaxMultiplier.Value : CorruptedPlugin.MinMultiplier.Value;
+    private float maxMultiplier => CorruptedPlugin.MaxMultiplier.Value;
 
     private void Start() => StartCoroutine(CorruptionLoop());
 
@@ -51,8 +73,15 @@ public class SceneCorruptor : MonoBehaviour
         while (true)
         {
             yield return new WaitForSecondsRealtime(CorruptedPlugin.CorruptionInterval.Value);
-            var source = FindObjectsOfType<GameObject>().Where(obj => obj != gameObject).ToArray();
-            if (source.Length > 0) CorruptObject(source[UnityEngine.Random.Range(0, source.Length)]);
+            var targets = FindObjectsOfType<GameObject>()
+                .Where(obj => obj != null && obj != gameObject && obj.scene.IsValid() && obj.scene.isLoaded)
+                .ToArray();
+
+            if (targets.Length > 0)
+            {
+                for (int i = 0; i < CorruptedPlugin.CorruptionAmount.Value; i++)
+                    CorruptObject(targets[UnityEngine.Random.Range(0, targets.Length)]);
+            }
         }
     }
 
@@ -63,6 +92,7 @@ public class SceneCorruptor : MonoBehaviour
         if (obj.TryGetComponent(out AudioSource audio)) CorruptAudioSource(audio);
         if (obj.TryGetComponent(out NavMeshAgent agent)) CorruptNavMeshAgent(agent);
         if (obj.TryGetComponent(out Renderer rend)) CorruptRenderer(rend);
+        if (obj.TryGetComponent(out Animator anim) && UnityEngine.Random.value < CorruptedPlugin.AnimatorCorruptionChance.Value) CorruptAnimator(anim);
         if (obj.TryGetComponent(out SpriteRenderer spr)) CorruptSpriteRenderer(spr);
         if (obj.TryGetComponent(out MeshFilter mf) && CorruptedPlugin.CorruptMeshFilters.Value) CorruptMeshFilter(mf);
         if (obj.TryGetComponent(out Collider col)) CorruptCollider(col);
@@ -141,23 +171,60 @@ public class SceneCorruptor : MonoBehaviour
                 Material newMat = GetRandomMaterial(mats[i]);
                 if (newMat != null) { mats[i] = newMat; continue; }
             }
-
-            for (int j = 0; j < mats[i].shader.GetPropertyCount(); j++)
-            {
-                if (mats[i].shader.GetPropertyType(j) != UnityEngine.Rendering.ShaderPropertyType.Color) continue;
-                string prop = mats[i].shader.GetPropertyName(j);
-                if (prop.IndexOf("color", StringComparison.OrdinalIgnoreCase) >= 0)
-                    mats[i].SetColor(prop, CorruptColor(mats[i].GetColor(prop)));
-            }
+            CorruptMaterialProperties(mats[i]);
         }
         rend.materials = mats;
+    }
+
+    private void CorruptMaterialProperties(Material mat)
+    {
+        if (mat == null || mat.shader == null) return;
+        Shader shader = mat.shader;
+        for (int i = 0; i < shader.GetPropertyCount(); i++)
+        {
+            string propName = shader.GetPropertyName(i);
+            if (CorruptedPlugin.ExcludeBuiltInShaderProperties.Value && propName.StartsWith("unity_")) continue;
+
+            int id = shader.GetPropertyNameId(i);
+            switch (shader.GetPropertyType(i))
+            {
+                case UnityEngine.Rendering.ShaderPropertyType.Color:
+                    mat.SetColor(id, CorruptColor(mat.GetColor(id)));
+                    break;
+                case UnityEngine.Rendering.ShaderPropertyType.Vector:
+                    mat.SetVector(id, CorruptVector4(mat.GetVector(id)));
+                    break;
+                case UnityEngine.Rendering.ShaderPropertyType.Float:
+                case UnityEngine.Rendering.ShaderPropertyType.Range:
+                    mat.SetFloat(id, CorruptFloat(mat.GetFloat(id)));
+                    break;
+                case UnityEngine.Rendering.ShaderPropertyType.Texture:
+                    if (UnityEngine.Random.value < 0.5f)
+                    {
+                        Texture tex = GetRandomAsset<Texture2D>();
+                        if (tex != null)
+                        {
+                            mat.SetTexture(id, tex);
+                            mat.SetTextureScale(id, CorruptVector2(mat.GetTextureScale(id)));
+                            mat.SetTextureOffset(id, CorruptVector2(mat.GetTextureOffset(id)));
+                        }
+                    }
+                    break;
+            }
+        }
     }
 
     private void CorruptSpriteRenderer(SpriteRenderer sr)
     {
         if (CorruptedPlugin.CorruptSprites.Value && sr.sprite != null && UnityEngine.Random.value < CorruptedPlugin.SpriteReplacementChance.Value) sr.sprite = GetRandomAsset(sr.sprite);
         sr.color = CorruptColor(sr.color);
-        if (CorruptedPlugin.CorruptMaterials.Value && sr.sharedMaterial != null && UnityEngine.Random.value < CorruptedPlugin.MaterialReplacementChance.Value) sr.sharedMaterial = GetRandomMaterial(sr.sharedMaterial);
+        if (CorruptedPlugin.CorruptMaterials.Value && sr.sharedMaterial != null)
+        {
+            if (UnityEngine.Random.value < CorruptedPlugin.MaterialReplacementChance.Value)
+                sr.sharedMaterial = GetRandomMaterial(sr.sharedMaterial);
+            else
+                CorruptMaterialProperties(sr.sharedMaterial);
+        }
     }
 
     private void CorruptMeshFilter(MeshFilter mf)
@@ -166,9 +233,7 @@ public class SceneCorruptor : MonoBehaviour
         Vector3[] verts = mf.mesh.vertices;
         float limit = CorruptedPlugin.MeshVertexCorruption.Value;
         for (int i = 0; i < verts.Length; i++)
-        {
             verts[i] += new Vector3(UnityEngine.Random.Range(-limit, limit), UnityEngine.Random.Range(-limit, limit), UnityEngine.Random.Range(-limit, limit));
-        }
         mf.mesh.vertices = verts;
         mf.mesh.RecalculateBounds();
         mf.mesh.RecalculateNormals();
@@ -214,14 +279,26 @@ public class SceneCorruptor : MonoBehaviour
         img.fillAmount = Mathf.Clamp01(CorruptFloat(img.fillAmount));
         if (CorruptedPlugin.CorruptSprites.Value && img.sprite != null && UnityEngine.Random.value < CorruptedPlugin.SpriteReplacementChance.Value) img.sprite = GetRandomAsset(img.sprite);
         img.color = CorruptColor(img.color);
-        if (CorruptedPlugin.CorruptMaterials.Value && img.material != null && UnityEngine.Random.value < CorruptedPlugin.MaterialReplacementChance.Value) img.material = GetRandomMaterial(img.material, true);
+        if (CorruptedPlugin.CorruptMaterials.Value && img.material != null)
+        {
+            if (UnityEngine.Random.value < CorruptedPlugin.MaterialReplacementChance.Value)
+                img.material = GetRandomMaterial(img.material, true);
+            else
+                CorruptMaterialProperties(img.material);
+        }
     }
 
     private void CorruptRawImage(RawImage img)
     {
         img.uvRect = new Rect(CorruptVector2(img.uvRect.position), CorruptVector2(img.uvRect.size));
         img.color = CorruptColor(img.color);
-        if (CorruptedPlugin.CorruptMaterials.Value && img.material != null && UnityEngine.Random.value < CorruptedPlugin.MaterialReplacementChance.Value) img.material = GetRandomMaterial(img.material, true);
+        if (CorruptedPlugin.CorruptMaterials.Value && img.material != null)
+        {
+            if (UnityEngine.Random.value < CorruptedPlugin.MaterialReplacementChance.Value)
+                img.material = GetRandomMaterial(img.material, true);
+            else
+                CorruptMaterialProperties(img.material);
+        }
     }
 
     private void CorruptSlider(Slider sld)
@@ -239,17 +316,54 @@ public class SceneCorruptor : MonoBehaviour
         rect.pivot = new Vector2(Mathf.Clamp01(CorruptFloat(rect.pivot.x)), Mathf.Clamp01(CorruptFloat(rect.pivot.y)));
     }
 
+    private void CorruptAnimator(Animator anim)
+    {
+        if (UnityEngine.Random.value < 0.5f)
+        {
+            Animator other = GetRandomAnimator(anim);
+            if (other != null && other.runtimeAnimatorController != null)
+            {
+                anim.runtimeAnimatorController = other.runtimeAnimatorController;
+                return;
+            }
+        }
+        anim.speed = Mathf.Clamp(CorruptFloat(anim.speed), -5f, 5f);
+    }
+
     private void CorruptScript(MonoBehaviour script)
     {
-        foreach (FieldInfo field in script.GetType().GetFields(BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic).Where(f => !f.IsInitOnly && !f.IsLiteral))
+        if (script is EventSystem || script is StandaloneInputModule) return;
+        Type type = script.GetType();
+        if (CorruptedPlugin.ExcludedNames.Contains(type.Name)) return;
+        foreach (FieldInfo field in type.GetFields(BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic).Where(f => !f.IsInitOnly && !f.IsLiteral))
         {
             try
             {
-                object obj = CorruptValue(field.GetValue(script), field.FieldType);
-                if (obj != null) field.SetValue(script, obj);
+                if (field.FieldType == typeof(string) && field.Name.IndexOf("scene", StringComparison.OrdinalIgnoreCase) >= 0) continue;
+                object val = field.GetValue(script);
+                object corrupted = CorruptValue(val, field.FieldType);
+                if (corrupted != null) field.SetValue(script, corrupted);
             }
-            catch (Exception ex) { Debug.LogWarning($"Couldn't corrupt {script.GetType().Name}.{field.Name}: {ex.Message}"); }
+            catch (Exception ex) { Debug.LogWarning($"Couldn't corrupt {type.Name}.{field.Name}: {ex.Message}"); }
         }
+        if (UnityEngine.Random.value < CorruptedPlugin.RandomMethodChance.Value) InvokeRandomMethod(script);
+    }
+
+    private void InvokeRandomMethod(MonoBehaviour script)
+    {
+        Type type = script.GetType();
+        var methods = type.GetMethods(BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic)
+            .Where(m => m != null && !m.IsSpecialName && (!CorruptedPlugin.IgnoreUnityMethods.Value || m.DeclaringType == type) && !m.IsGenericMethodDefinition && !m.IsAbstract)
+            .Where(m => !CorruptedPlugin.ExcludedNames.Contains(m.Name))
+            .Where(m => m.GetParameters().All(p => !p.ParameterType.IsByRef && CanGenerateRandomValue(p.ParameterType)))
+            .ToArray();
+
+        if (methods.Length == 0) return;
+        MethodInfo method = methods[UnityEngine.Random.Range(0, methods.Length)];
+        object[] args = method.GetParameters().Select(p => GenerateRandomValue(p.ParameterType)).ToArray();
+
+        try { method.Invoke(script, args); }
+        catch (Exception ex) { Debug.LogWarning($"[SceneCorruptor] Couldn't invoke {type.Name}.{method.Name}: {ex.Message}"); }
     }
 
     private object CorruptValue(object val, Type type)
@@ -261,6 +375,9 @@ public class SceneCorruptor : MonoBehaviour
         if (type == typeof(long)) return CorruptLong((long)val);
         if (type == typeof(short)) return (short)Mathf.Clamp(CorruptInt((short)val), -32768, 32767);
         if (type == typeof(byte)) return (byte)Mathf.Clamp(CorruptInt((byte)val), 0, 255);
+        if (type == typeof(uint)) return (uint)Mathf.Max(0, Mathf.RoundToInt((float)(uint)val * RandomMultiplier()));
+        if (type == typeof(bool)) return UnityEngine.Random.value < 0.5f ? !(bool)val : val;
+        if (type == typeof(string)) return CorruptString((string)val);
         if (type == typeof(Vector2)) return CorruptVector2((Vector2)val);
         if (type == typeof(Vector3)) return CorruptVector3((Vector3)val);
         if (type == typeof(Vector4)) return CorruptVector4((Vector4)val);
@@ -270,14 +387,67 @@ public class SceneCorruptor : MonoBehaviour
         if (type == typeof(Sprite)) return CorruptedPlugin.CorruptSprites.Value ? GetRandomAsset((Sprite)val) : val;
         if (type == typeof(Material)) return CorruptedPlugin.CorruptMaterials.Value ? GetRandomMaterial((Material)val) : val;
 
-        if (type.IsArray && (type.GetElementType() == typeof(Sprite) || type.GetElementType() == typeof(Material) || type.GetElementType() == typeof(AudioClip)))
+        if (type.IsArray)
         {
             Array arr = (Array)val;
-            Array newArr = Array.CreateInstance(type.GetElementType(), arr.Length);
-            for (int i = 0; i < arr.Length; i++) newArr.SetValue(CorruptValue(arr.GetValue(i), type.GetElementType()), i);
+            Type elemType = type.GetElementType();
+            Array newArr = Array.CreateInstance(elemType, arr.Length);
+            for (int i = 0; i < arr.Length; i++) newArr.SetValue(CorruptValue(arr.GetValue(i), elemType), i);
             return newArr;
         }
         return val;
+    }
+
+    private bool CanGenerateRandomValue(Type t) =>
+        t != typeof(void) && !t.IsByRef && (
+            t == typeof(bool) || t == typeof(byte) || t == typeof(sbyte) || t == typeof(short) || t == typeof(ushort) ||
+            t == typeof(int) || t == typeof(uint) || t == typeof(long) || t == typeof(ulong) || t == typeof(float) ||
+            t == typeof(double) || t == typeof(decimal) || t == typeof(char) || t == typeof(string) || t.IsEnum ||
+            t == typeof(Vector2) || t == typeof(Vector3) || t == typeof(Vector4) || t == typeof(Vector2Int) ||
+            t == typeof(Vector3Int) || t == typeof(Quaternion) || t == typeof(Color) || t == typeof(Color32) ||
+            t == typeof(Rect) || typeof(UnityEngine.Object).IsAssignableFrom(t) || (t.IsArray && CanGenerateRandomValue(t.GetElementType()))
+        );
+
+    private object GenerateRandomValue(Type t)
+    {
+        if (t == typeof(bool)) return UnityEngine.Random.value < 0.5f;
+        if (t == typeof(byte)) return (byte)UnityEngine.Random.Range(0, 256);
+        if (t == typeof(sbyte)) return (sbyte)UnityEngine.Random.Range(-128, 128);
+        if (t == typeof(short)) return (short)UnityEngine.Random.Range(-32768, 32767);
+        if (t == typeof(ushort)) return (ushort)UnityEngine.Random.Range(0, 65535);
+        if (t == typeof(int)) return UnityEngine.Random.Range(-100000, 100001);
+        if (t == typeof(uint)) return (uint)UnityEngine.Random.Range(0, int.MaxValue);
+        if (t == typeof(long)) return (long)UnityEngine.Random.Range(int.MinValue, int.MaxValue);
+        if (t == typeof(ulong)) return (ulong)UnityEngine.Random.Range(0, int.MaxValue);
+        if (t == typeof(float)) return UnityEngine.Random.Range(-1000f, 1000f);
+        if (t == typeof(double)) return (double)UnityEngine.Random.Range(-1000f, 1000f);
+        if (t == typeof(decimal)) return (decimal)UnityEngine.Random.Range(-1000f, 1000f);
+        if (t == typeof(char)) return (char)UnityEngine.Random.Range(32, 127);
+        if (t == typeof(string)) return CorruptString("SampleStringText");
+        if (t.IsEnum) { Array v = Enum.GetValues(t); return v.Length > 0 ? v.GetValue(UnityEngine.Random.Range(0, v.Length)) : Activator.CreateInstance(t); }
+        if (t == typeof(Vector2)) return new Vector2(UnityEngine.Random.Range(-100f, 100f), UnityEngine.Random.Range(-100f, 100f));
+        if (t == typeof(Vector3)) return new Vector3(UnityEngine.Random.Range(-100f, 100f), UnityEngine.Random.Range(-100f, 100f), UnityEngine.Random.Range(-100f, 100f));
+        if (t == typeof(Vector4)) return new Vector4(UnityEngine.Random.Range(-100f, 100f), UnityEngine.Random.Range(-100f, 100f), UnityEngine.Random.Range(-100f, 100f), UnityEngine.Random.Range(-100f, 100f));
+        if (t == typeof(Vector2Int)) return new Vector2Int(UnityEngine.Random.Range(-100, 101), UnityEngine.Random.Range(-100, 101));
+        if (t == typeof(Vector3Int)) return new Vector3Int(UnityEngine.Random.Range(-100, 101), UnityEngine.Random.Range(-100, 101), UnityEngine.Random.Range(-100, 101));
+        if (t == typeof(Quaternion)) return Quaternion.Euler(UnityEngine.Random.Range(0f, 360f), UnityEngine.Random.Range(0f, 360f), UnityEngine.Random.Range(0f, 360f));
+        if (t == typeof(Color)) return new Color(UnityEngine.Random.value, UnityEngine.Random.value, UnityEngine.Random.value, UnityEngine.Random.value);
+        if (t == typeof(Color32)) return new Color32((byte)UnityEngine.Random.Range(0, 256), (byte)UnityEngine.Random.Range(0, 256), (byte)UnityEngine.Random.Range(0, 256), (byte)UnityEngine.Random.Range(0, 256));
+        if (t == typeof(Rect)) return new Rect(UnityEngine.Random.Range(-100f, 100f), UnityEngine.Random.Range(-100f, 100f), UnityEngine.Random.Range(-100f, 100f), UnityEngine.Random.Range(-100f, 100f));
+        if (typeof(UnityEngine.Object).IsAssignableFrom(t))
+        {
+            var assets = Resources.FindObjectsOfTypeAll(t).Where(a => a != null).ToArray();
+            return assets.Length > 0 ? assets[UnityEngine.Random.Range(0, assets.Length)] : null;
+        }
+        if (t.IsArray)
+        {
+            Type elem = t.GetElementType();
+            int len = UnityEngine.Random.Range(0, 6);
+            Array arr = Array.CreateInstance(elem, len);
+            for (int i = 0; i < len; i++) arr.SetValue(GenerateRandomValue(elem), i);
+            return arr;
+        }
+        return null;
     }
 
     private T GetRandomAsset<T>(T current = null) where T : UnityEngine.Object
@@ -286,18 +456,67 @@ public class SceneCorruptor : MonoBehaviour
         return assets.Length > 0 ? assets[UnityEngine.Random.Range(0, assets.Length)] : current;
     }
 
+    private Animator GetRandomAnimator(Animator current)
+    {
+        var animators = Resources.FindObjectsOfTypeAll<Animator>()
+            .Where(a => a != null && a != current && a.gameObject.scene.IsValid() && a.gameObject.scene.isLoaded && a.runtimeAnimatorController != null && a.gameObject != gameObject)
+            .ToArray();
+        return animators.Length > 0 ? animators[UnityEngine.Random.Range(0, animators.Length)] : null;
+    }
+
     private Material GetRandomMaterial(Material current = null, bool uiMaterial = false)
     {
-        Texture2D tex = GetRandomAsset<Texture2D>();
-        if (tex == null) return current;
+        Shader[] shaders = Resources.FindObjectsOfTypeAll<Shader>()
+            .Where(s => s != null && !s.name.StartsWith("Hidden/") && (!uiMaterial || s.name.ToLower().Contains("ui"))).ToArray();
+        if (shaders.Length == 0) return current;
 
-        Shader shader = Shader.Find(uiMaterial ? "UI/Default" : "Legacy Shaders/Transparent/Diffuse");
-        if (shader == null) return current;
+        Shader shader = shaders[UnityEngine.Random.Range(0, shaders.Length)];
+        try
+        {
+            Material mat = new Material(shader) { name = "Corrupted_" + shader.name };
+            for (int i = 0; i < shader.GetPropertyCount(); i++)
+            {
+                string propName = shader.GetPropertyName(i);
+                if (CorruptedPlugin.ExcludeBuiltInShaderProperties.Value && propName.StartsWith("unity_")) continue;
 
-        Texture2D newTex = new Texture2D(tex.width, tex.height, TextureFormat.RGBA32, false) { name = tex.name + "_CorruptedCopy", filterMode = FilterMode.Point, anisoLevel = 0 };
-        try { newTex.SetPixels(tex.GetPixels()); newTex.Apply(false, false); }
-        catch { UnityEngine.Object.Destroy(newTex); return current; }
+                int id = shader.GetPropertyNameId(i);
+                switch (shader.GetPropertyType(i))
+                {
+                    case UnityEngine.Rendering.ShaderPropertyType.Color:
+                        mat.SetColor(id, new Color(UnityEngine.Random.value, UnityEngine.Random.value, UnityEngine.Random.value, UnityEngine.Random.value));
+                        break;
+                    case UnityEngine.Rendering.ShaderPropertyType.Vector:
+                        mat.SetVector(id, new Vector4(UnityEngine.Random.Range(-3f, 3f), UnityEngine.Random.Range(-3f, 3f), UnityEngine.Random.Range(-3f, 3f), UnityEngine.Random.Range(-3f, 3f)));
+                        break;
+                    case UnityEngine.Rendering.ShaderPropertyType.Float:
+                    case UnityEngine.Rendering.ShaderPropertyType.Range:
+                        mat.SetFloat(id, UnityEngine.Random.Range(-5f, 5f));
+                        break;
+                    case UnityEngine.Rendering.ShaderPropertyType.Texture:
+                        Texture tex = GetRandomAsset<Texture2D>();
+                        if (tex != null)
+                        {
+                            mat.SetTexture(id, tex);
+                            mat.SetTextureScale(id, new Vector2(UnityEngine.Random.Range(-3f, 3f), UnityEngine.Random.Range(-3f, 3f)));
+                            mat.SetTextureOffset(id, new Vector2(UnityEngine.Random.Range(-3f, 3f), UnityEngine.Random.Range(-3f, 3f)));
+                        }
+                        break;
+                }
+            }
+            mat.renderQueue = UnityEngine.Random.Range(0, 5000);
+            mat.doubleSidedGI = UnityEngine.Random.value < 0.5f;
+            mat.enableInstancing = UnityEngine.Random.value < 0.5f;
 
-        return new Material(shader) { name = "Corrupted_" + tex.name, mainTexture = newTex };
+            foreach (string kw in mat.shaderKeywords)
+            {
+                if (UnityEngine.Random.value < 0.5f)
+                {
+                    if (mat.IsKeywordEnabled(kw)) mat.DisableKeyword(kw);
+                    else mat.EnableKeyword(kw);
+                }
+            }
+            return mat;
+        }
+        catch { return current; }
     }
 }
